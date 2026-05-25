@@ -149,6 +149,7 @@ class Terminal:
         self.balked_count = 0
         self.berth_busy_time = 0.0
         self.berth_busy_time_post_warmup = 0.0
+        self.queue_log = [(0.0, 0)]  # (time, len)
 
 class FerryLine:
     def __init__(self, env: simpy.Environment, sim, name: str, origin: Terminal, dest: Terminal, 
@@ -172,6 +173,8 @@ class FerryLine:
         
         self.total_capacity_offered = 0
         self.total_pax_carried = 0
+        self.post_warmup_capacity_offered = 0
+        self.post_warmup_pax_carried = 0
         
         self.env.process(self.run_schedule())
 
@@ -236,6 +239,7 @@ class FerryLine:
                 break
 
             self.origin.waiting_passengers.remove(p)
+            self.origin.queue_log.append((self.env.now, len(self.origin.waiting_passengers)))
             yield self.env.timeout(b_time)
 
             p.board_time = self.env.now
@@ -264,10 +268,14 @@ class FerryLine:
             # Route switching (only when shuttle is active) with q=0.6, if an indirect path exists
             if self.sim.config.get('shuttle', False) and not p.indirect_route:
                 if self.sim.route_rng.random() < 0.6:
+                    # Look up if there's an indirect route to their final destination from this origin
+                    # Only apply switching if the current ferry that left them behind was the direct option
                     via = self.sim.transfers.get(self.origin.name, {}).get(p.destination)
                     if via is not None and via != self.dest.name:
-                        p.route = [via, p.destination]
-                        p.indirect_route = True
+                        # Ensures the passenger only switches to an indirect route if they missed the direct line
+                        if self.dest.name == p.destination:
+                            p.route = [via, p.destination]
+                            p.indirect_route = True
 
         # Berth occupancy tracking (origin dwell)
         berth_end = self.env.now
@@ -282,6 +290,9 @@ class FerryLine:
 
         self.total_capacity_offered += self.capacity
         self.total_pax_carried += len(boarded)
+        if self.env.now >= WARMUP:
+            self.post_warmup_capacity_offered += self.capacity
+            self.post_warmup_pax_carried += len(boarded)
 
         # 4. Travel
         yield self.env.timeout(self.travel_time)
@@ -312,13 +323,16 @@ class Simulation:
         self.eminonu_rates = eminonu_rates
         
         seed_seq = np.random.SeedSequence(config['base_seed'] + rep)
-        streams = seed_seq.spawn(10)
-        self.arr_rng = np.random.default_rng(streams[0])
-        self.turn_rng = np.random.default_rng(streams[1])
-        self.board_rng = np.random.default_rng(streams[2])
-        self.weath_rng = np.random.default_rng(streams[3])
-        self.route_rng = np.random.default_rng(streams[4])
-        self.dest_rng = np.random.default_rng(streams[5])
+        streams = seed_seq.spawn(14)
+        self.arr_rng_A1 = np.random.default_rng(streams[0])
+        self.arr_rng_E1 = np.random.default_rng(streams[1])
+        self.arr_rng_A2 = np.random.default_rng(streams[2])
+        self.arr_rng_E2 = np.random.default_rng(streams[3])
+        self.turn_rng = np.random.default_rng(streams[4])
+        self.board_rng = np.random.default_rng(streams[5])
+        self.weath_rng = np.random.default_rng(streams[6])
+        self.route_rng = np.random.default_rng(streams[7])
+        self.dest_rng = np.random.default_rng(streams[8])
         
         self.terminals = {
             'A1': Terminal(self.env, 'A1', 3, 1500, 8, 6),
@@ -456,16 +470,20 @@ class Simulation:
                 continue
 
             if origin == 'A1':
+                arr_rng = self.arr_rng_A1
                 # A1 and E1 use CSV-derived historical rates by period with fallback for sparse periods.
                 total_rate, splits = self._historical_profile('A1', period, destinations)
             elif origin == 'E1':
+                arr_rng = self.arr_rng_E1
                 total_rate, splits = self._historical_profile('E1', period, destinations)
             elif origin == 'A2':
+                arr_rng = self.arr_rng_A2
                 # A2/E2 use base rates multiplied by direction/period factors (Table 6) with fixed OD splits.
                 splits = {d: float(A2_SPLITS.get(d, 0.0)) for d in destinations}
                 mult = DIR_MULT['Asia->Europe'].get(period, 1.0)
                 total_rate = A2_BASE_RATE * mult
             else:  # E2
+                arr_rng = self.arr_rng_E2
                 splits = {d: float(E2_SPLITS.get(d, 0.0)) for d in destinations}
                 mult = DIR_MULT['Europe->Asia'].get(period, 1.0)
                 total_rate = E2_BASE_RATE * mult
@@ -489,7 +507,7 @@ class Simulation:
                     break
 
                 # `total_rate` is in pax/min; convert to seconds-based inter-arrival time.
-                delta = float(self.arr_rng.exponential(1.0 / total_rate) * 60.0)
+                delta = float(arr_rng.exponential(1.0 / total_rate) * 60.0)
                 if delta >= time_to_boundary:
                     # Crosses period boundary: move to boundary and sample again under new period rate.
                     yield self.env.timeout(time_to_boundary)
@@ -533,6 +551,7 @@ class Simulation:
             return
 
         term.waiting_passengers.append(p)
+        term.queue_log.append((self.env.now, len(term.waiting_passengers)))
 
     def run(self):
         """Start all demand processes and run the environment through the full horizon."""
@@ -552,21 +571,21 @@ class Simulation:
         def safe_mean(lst):
             return float(np.mean(lst)) if lst else 0.0
 
-        # Journey times (minutes)
-        jt = [(p.disembark_time - p.arrival_time) / 60.0 for p in served_pax]
+        # Journey times (seconds)
+        jt = [(p.disembark_time - p.arrival_time) for p in served_pax]
         jt_by_dest = {
-            'E1': [(p.disembark_time - p.arrival_time) / 60.0 for p in served_pax if p.destination == 'E1'],
-            'E2': [(p.disembark_time - p.arrival_time) / 60.0 for p in served_pax if p.destination == 'E2'],
-            'A1': [(p.disembark_time - p.arrival_time) / 60.0 for p in served_pax if p.destination == 'A1'],
-            'A2': [(p.disembark_time - p.arrival_time) / 60.0 for p in served_pax if p.destination == 'A2'],
+            'E1': [(p.disembark_time - p.arrival_time) for p in served_pax if p.destination == 'E1'],
+            'E2': [(p.disembark_time - p.arrival_time) for p in served_pax if p.destination == 'E2'],
+            'A1': [(p.disembark_time - p.arrival_time) for p in served_pax if p.destination == 'A1'],
+            'A2': [(p.disembark_time - p.arrival_time) for p in served_pax if p.destination == 'A2'],
         }
 
-        # Wait times (minutes) per terminal, including transfers
+        # Wait times (seconds) per terminal, including transfers
         waits_by_term = {k: [] for k in ['A1', 'A2', 'E1', 'E2']}
         for p in served_pax:
             for term_code, wait_sec in p.wait_times:
                 if term_code in waits_by_term:
-                    waits_by_term[term_code].append(wait_sec / 60.0)
+                    waits_by_term[term_code].append(wait_sec)
 
         total_arr = len(total_pax)
         total_pax_served = len(served_pax)
@@ -576,32 +595,15 @@ class Simulation:
         loss_rate = sum(1 for p in total_pax if p.balked) / max(total_arr, 1)
         lb_rate = sum(1 for p in total_pax if p.left_behind_events > 0) / max(total_arr, 1)
 
-        # Missed connections are only meaningful for transfer passengers.
-        # Project definition: fraction of transfer passengers with second-leg wait > one L5 headway.
+        # Missed connections are explicitly tracked in the boarding logic when a transfer passenger is left behind.
         transfer_pax = [p for p in served_pax if p.transferred]
-        l5_lines = [l for l in self.lines if l.name in ('L5', 'L5_rev')]
-        l5_headway_sec = float(min(l.peak_hw for l in l5_lines)) if l5_lines else (15.0 * 60.0)
-
-        transfer_with_second_wait = [p for p in transfer_pax if len(p.wait_times) >= 2]
-        for p in transfer_with_second_wait:
-            # Robust to potential future extensions with additional transfers.
-            p.missed_connection = p.wait_times[-1][1] > l5_headway_sec
-
-        missed_conn_rate = (
-            sum(1 for p in transfer_with_second_wait if p.missed_connection) / len(transfer_with_second_wait)
-        ) if transfer_with_second_wait else 0.0
-        if transfer_pax:
-            if len(transfer_with_second_wait) < len(transfer_pax):
-                print(
-                    f"Warning: {len(transfer_pax) - len(transfer_with_second_wait)} transfer passengers "
-                    "missing second-leg wait-time records."
-                )
+        missed_conn_rate = sum(1 for p in transfer_pax if p.missed_connection) / len(transfer_pax) if transfer_pax else 0.0
 
         # Load factors
-        lf_L1 = sum(l.total_pax_carried for l in self.lines if 'L1' in l.name) / max(sum(l.total_capacity_offered for l in self.lines if 'L1' in l.name), 1)
-        lf_L2 = sum(l.total_pax_carried for l in self.lines if 'L2' in l.name) / max(sum(l.total_capacity_offered for l in self.lines if 'L2' in l.name), 1)
-        lf_L3 = sum(l.total_pax_carried for l in self.lines if 'L3' in l.name) / max(sum(l.total_capacity_offered for l in self.lines if 'L3' in l.name), 1)
-        lf_L4 = sum(l.total_pax_carried for l in self.lines if 'L4' in l.name) / max(sum(l.total_capacity_offered for l in self.lines if 'L4' in l.name), 1)
+        lf_L1 = sum(l.post_warmup_pax_carried for l in self.lines if 'L1' in l.name) / max(sum(l.post_warmup_capacity_offered for l in self.lines if 'L1' in l.name), 1)
+        lf_L2 = sum(l.post_warmup_pax_carried for l in self.lines if 'L2' in l.name) / max(sum(l.post_warmup_capacity_offered for l in self.lines if 'L2' in l.name), 1)
+        lf_L3 = sum(l.post_warmup_pax_carried for l in self.lines if 'L3' in l.name) / max(sum(l.post_warmup_capacity_offered for l in self.lines if 'L3' in l.name), 1)
+        lf_L4 = sum(l.post_warmup_pax_carried for l in self.lines if 'L4' in l.name) / max(sum(l.post_warmup_capacity_offered for l in self.lines if 'L4' in l.name), 1)
 
         # Berth utilization (post-warm-up)
         obs_time = TOTAL_TIME - WARMUP
@@ -609,6 +611,27 @@ class Simulation:
         denom_e = self.terminals['E1'].berths.capacity * obs_time
         berth_util_kadikoy = (self.terminals['A1'].berth_busy_time_post_warmup / denom_k) if denom_k > 0 else 0.0
         berth_util_eminonu = (self.terminals['E1'].berth_busy_time_post_warmup / denom_e) if denom_e > 0 else 0.0
+
+        def calc_avg_q(q_log):
+            # Filter for post-warmup
+            pts = [(max(t, WARMUP), q) for t, q in q_log if t <= TOTAL_TIME]
+            if not pts: return 0.0
+            # Ensure start at WARMUP and end at TOTAL_TIME
+            if pts[0][0] > WARMUP:
+                prev_q = next((q for t, q in reversed(q_log) if t <= WARMUP), 0)
+                pts.insert(0, (WARMUP, prev_q))
+            if pts[-1][0] < TOTAL_TIME:
+                pts.append((TOTAL_TIME, pts[-1][1]))
+            # Trapezoidal integration for step function (left endpoint rectangles)
+            times = [t for t, q in pts]
+            qs = [q for t, q in pts]
+            integral = sum(qs[i] * (times[i+1] - times[i]) for i in range(len(pts)-1))
+            return integral / (TOTAL_TIME - WARMUP) if TOTAL_TIME > WARMUP else 0.0
+
+        avg_q_kadikoy = calc_avg_q(self.terminals['A1'].queue_log)
+        avg_q_uskudar = calc_avg_q(self.terminals['A2'].queue_log)
+        avg_q_eminonu = calc_avg_q(self.terminals['E1'].queue_log)
+        avg_q_besiktas = calc_avg_q(self.terminals['E2'].queue_log)
 
         kpis = {
             'avg_journey_time': safe_mean(jt),
@@ -627,6 +650,10 @@ class Simulation:
             'avg_wait_uskudar': safe_mean(waits_by_term['A2']),
             'avg_wait_eminonu': safe_mean(waits_by_term['E1']),
             'avg_wait_besiktas': safe_mean(waits_by_term['E2']),
+            'avg_q_kadikoy': avg_q_kadikoy,
+            'avg_q_uskudar': avg_q_uskudar,
+            'avg_q_eminonu': avg_q_eminonu,
+            'avg_q_besiktas': avg_q_besiktas,
             'berth_util_kadikoy': berth_util_kadikoy,
             'berth_util_eminonu': berth_util_eminonu,
             'missed_conn_rate': missed_conn_rate,
@@ -685,7 +712,7 @@ def generate_output_plots(results_df: pd.DataFrame, summary_df: pd.DataFrame, ou
         summary_df,
         'avg_journey_time',
         'Average Journey Time by Scenario (95% CI)',
-        'Minutes',
+        'Seconds',
         os.path.join(out_dir, 'avg_journey_time_ci.png')
     )
     _plot_kpi_with_ci(
@@ -721,7 +748,7 @@ def generate_output_plots(results_df: pd.DataFrame, summary_df: pd.DataFrame, ou
         plt.boxplot(data, labels=order, showmeans=True)
         plt.title('Replication Distribution: Average Journey Time')
         plt.xlabel('Scenario')
-        plt.ylabel('Minutes')
+        plt.ylabel('Seconds')
         plt.grid(axis='y', alpha=0.25)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, 'avg_journey_time_boxplot.png'), dpi=200)
