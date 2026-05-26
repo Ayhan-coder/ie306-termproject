@@ -1,0 +1,227 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{microtype}
+
+\title{\textbf{Istanbul Ferry Terminal Operations: \\ Discrete-Event Simulation and Operational Analysis}}
+\author{\textbf{IE 306 --- Systems Simulation Term Project} \\ Group Project}
+\date{Spring 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents a discrete-event simulation model of the Istanbul Bosphorus ferry terminal network using SimPy. The network connects two Asian-side terminals (Kad\i k\"{o}y and \"Usk\"{u}dar) to two European-side terminals (Emin\"{o}n\"{u} and Be\c{s}ikta\c{s}) via four regular cross-Bosphorus lines and one optional shuttle line. A non-homogeneous Poisson process (NHPP) is fitted to historical arrival records to represent time-varying passenger demand. We address critical modeling decisions, including turnstile queues, berth contention, dwell-time limits, route-switching for left-behind passengers, and weather disruptions (Lodos storms). The experimental design evaluates five operational scenarios alongside a custom intermediate frequency scenario. Common Random Numbers (CRN) are strictly synchronized by pre-sampling passenger attributes at birth using origin-specific random streams. The results demonstrate that under calm conditions, increasing frequency by 50\% reduces average journey times by 24\%, while the European-side shuttle provides a flexible alternative path. Under storm stress tests, a combined frequency increase and shuttle network intervention successfully mitigates gridlock, reducing average journey times by 44\% and reducing passenger loss (balking) by 98\%.
+\end{abstract}
+
+\section{Introduction}
+Istanbul’s Bosphorus ferry network is a vital component of the city's transit infrastructure, carrying hundreds of thousands of daily commuters between Asia and Europe. Managing such a network involves handling time-varying passenger demand, berth constraints at terminals, vessel boarding limits, passenger transfers, and weather-related cancellations. 
+
+In this project, we construct a discrete-event simulation model using SimPy to evaluate operational interventions under both normal (Calm) and disrupted (Lodos storm) weather conditions. The network consists of four terminals:
+\begin{itemize}
+    \item \textbf{Asian Side}: Kad\i k\"{o}y (A1) and \"Usk\"{u}dar (A2).
+    \item \textbf{European Side}: Emin\"{o}n\"{u} (E1) and Be\c{s}ikta\c{s} (E2).
+\end{itemize}
+These terminals are connected by four cross-Bosphorus lines ($L_1$--$L_4$) and an optional shuttle line ($L_5$) connecting the two European terminals, as shown in Table \ref{tab:ferry_lines}.
+
+\begin{table}[H]
+\centering
+\caption{Ferry Line Parameters}
+\label{tab:ferry_lines}
+\begin{tabular}{cccccc}
+\toprule
+\textbf{Line} & \textbf{Route} & \textbf{Vessel Capacity} & \textbf{Peak Headway} & \textbf{Off-Peak Headway} & \textbf{Travel Time} \\
+\midrule
+$L_1$ & A1 $\leftrightarrow$ E1 & 400 pax & 15 min & 30 min & 20 min \\
+$L_2$ & A1 $\leftrightarrow$ E2 & 200 pax & 20 min & 40 min & 25 min \\
+$L_3$ & A2 $\leftrightarrow$ E1 & 200 pax & 20 min & 40 min & 15 min \\
+$L_4$ & A2 $\leftrightarrow$ E2 & 200 pax & 30 min & 60 min & 20 min \\
+$L_5$ & E1 $\leftrightarrow$ E2 & 200 pax & 15 min & 15 min & 10 min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{System Description \& Modeling Decisions}
+
+\subsection{Terminal Parameters and Dwell Times}
+Each terminal has a finite number of berths (docking slots), a shared waiting area with finite passenger capacity, and a set of parallel turnstiles, as summarized in Table \ref{tab:terminals}.
+
+\begin{table}[H]
+\centering
+\caption{Terminal Configurations}
+\label{tab:terminals}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Terminal} & \textbf{Berths} & \textbf{Waiting Capacity} & \textbf{Turnstiles} & \textbf{Dwell Time} \\
+\midrule
+Kad\i k\"{o}y (A1)   & 3 & 1,500 pax & 8 & 6 min \\
+\"Usk\"{u}dar (A2)  & 2 & 600 pax   & 4 & 5 min \\
+Emin\"{o}n\"{u} (E1) & 3 & 1,200 pax & 6 & 6 min \\
+Be\c{s}ikta\c{s} (E2) & 2 & 800 pax   & 4 & 5 min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A ferry arriving at a terminal with all berths occupied must wait offshore. When a ferry docks, it remains at the berth for a fixed dwell time (Table \ref{tab:terminals}). During this time, passengers board. Boarding stops when the ferry reaches capacity or the dwell time expires, whichever comes first. Left-behind passengers wait for the next sailing.
+
+\subsection{Passenger Arrivals and Service Times}
+Passengers arrive at each terminal as a non-homogeneous Poisson process. Upon arrival, passengers queue to pass through parallel turnstiles, each taking an exponentially distributed service time with a mean of 3 seconds. 
+
+Balking occurs after the turnstile: if the number of waiting passengers equals the terminal's waiting capacity, the next passenger exiting the turnstile discovers the waiting area is full, leaves the system immediately, and is counted as lost.
+
+Boarding is simulated as a sequential process where passengers board the ferry one by one, each taking an exponentially distributed time with a mean of 1 second. Boarding follows a First-Come, First-Served (FCFS) queueing discipline among passengers whose next leg matches the ferry's destination.
+
+\subsection{Route Choice and Left-Behind Switching}
+Under normal operations, passengers choose the direct line. However, when the $L_5$ European-side shuttle is active, passengers traveling between Kad\i k\"{o}y (A1) or \"Usk\"{u}dar (A2) and Be\c{s}ikta\c{s} (E2) can take an indirect route through Emin\"{o}n\"{u} (E1) and then transfer via the shuttle. 
+
+If a passenger waiting at their origin is left behind by a departing direct ferry, they switch to the indirect route with a probability $q = 0.6$, provided an indirect route exists. Transfer passengers disembark instantly at E1, request the turnstile, pass through E1 turnstile queues, and wait in E1's waiting area for the shuttle.
+
+\subsection{Weather Disruptions}
+Under Lodos storm conditions, each scheduled sailing is independently cancelled with a probability $p_{\text{cancel}} = 0.20$. Passengers waiting for a cancelled ferry remain in the waiting area, and the next departure is generated according to the scheduled headway.
+
+\section{Input Data Analysis}
+Historical passenger arrival records for Kad\i k\"{o}y (A1) and Emin\"{o}n\"{u} (E1) were provided in `arrivals_kadikoy.csv` and `arrivals_eminonu.csv`. The time-of-day periods are:
+\begin{itemize}
+    \item \textbf{AM Peak}: 07:00--09:00 (seconds 3600--10800)
+    \item \textbf{Midday}: 09:00--17:00 (seconds 10800--39600)
+    \item \textbf{PM Peak}: 17:00--19:00 (seconds 39600--46800)
+    \item \textbf{Low}: 06:00--07:00 and 19:00--22:00 (seconds 0--3600 and 46800--57600)
+\end{itemize}
+
+\subsection{Methodological Correction of the Low-Demand Period}
+Calculating inter-arrival times for the "Low" period requires caution. Because the "Low" period consists of two disjoint windows (morning and evening), sorting all low-period arrivals chronologically on a given day creates an artificial 12-hour gap (~43,200 seconds) between the last morning arrival and the first evening arrival. This outlier heavily distorts the estimated arrival rate. 
+
+We corrected this by computing inter-arrival times within the morning and evening windows independently, then pooling them. This lowered the mean low-period inter-arrival time at Kad\i k\"{o}y from 46.68 seconds to 11.64 seconds, adjusting the estimated arrival rate from 1.29 to 5.15 passengers/minute.
+
+\subsection{Distribution Fitting and Goodness-of-Fit Tests}
+We fitted exponential distributions to the inter-arrival times for each period using maximum likelihood estimation (MLE). Under MLE, the rate parameter $\lambda$ is given by:
+\begin{equation}
+    \lambda = \frac{1}{\bar{x}}
+\end{equation}
+where $\bar{x}$ is the sample mean of the inter-arrival times. We performed Kolmogorov-Smirnov (KS) goodness-of-fit tests to test the null hypothesis that inter-arrival times follow an exponential distribution. The results are summarized in Table \ref{tab:input_analysis}.
+
+\begin{table}[H]
+\centering
+\caption{Input Analysis and Distribution Fitting Summary}
+\label{tab:input_analysis}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Terminal} & \textbf{Period} & \textbf{Sample Size} & \textbf{Mean Inter-Arrival (s)} & \textbf{Rate (pax/min)} & \textbf{KS Stat ($D$)} & \textbf{KS $p$-value} \\
+\midrule
+Kad\i k\"{o}y (A1) & AM Peak & 747,822 & 1.75 & 34.26 & 0.0282 & 0.00 \\
+                   & Midday  & 1,198,893 & 4.37 & 13.73 & 0.0286 & 0.00 \\
+                   & PM Peak & 223,634  & 5.85 & 10.26 & 0.0290 & $4.50 \times 10^{-164}$ \\
+                   & Low     & 224,310  & 11.64 & 5.15 & 0.0287 & $1.31 \times 10^{-160}$ \\
+\midrule
+Emin\"{o}n\"{u} (E1) & AM Peak & 83,781  & 15.57 & 3.85 & 0.0273 & $1.39 \times 10^{-54}$ \\
+                   & Midday  & 449,019 & 11.66 & 5.14 & 0.0287 & 0.00 \\
+                   & PM Peak & 281,332 & 4.65  & 12.90 & 0.0295 & $1.38 \times 10^{-213}$ \\
+                   & Low     & 83,763  & 31.00 & 1.94 & 0.0300 & $5.97 \times 10^{-66}$ \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Goodness-of-Fit Interpretation}
+All KS tests reject the null hypothesis of an exponential distribution at the $\alpha = 0.05$ significance level ($p < 0.001$). This rejection is a well-known consequence of using massive datasets. With sample sizes exceeding 80,000 observations, goodness-of-fit tests have extreme power, detecting even minor deviations such as 1-second record rounding or slight within-period demand trends. 
+
+However, because the KS statistics are extremely small ($D \le 0.030$) and visual inspection of the Q-Q plots confirms high alignment across all quantiles, the exponential distribution serves as a highly accurate and practically valid approximation for passenger arrivals.
+
+\subsection{Destination Splits and Given Parameters}
+For Kad\i k\"{o}y and Emin\"{o}n\"{u}, destination splits were estimated directly from historical destination counts. For \"Usk\"{u}dar (A2) and Be\c{s}ikta\c{s} (E2), the base rates (A2: 1,000 pax/hr, E2: 500 pax/hr) and destination splits (A2: 55\% to E1, 45\% to E2; E2: 60\% to A1, 40\% to A2) were given. These base rates are scaled by the direction multipliers:
+\begin{equation}
+    \lambda_{o \to d}(t) = \lambda_o^{\text{base}} \times p_{o \to d} \times m_{\text{dir}}(\text{period}(t), \text{direction}(o, d))
+\end{equation}
+The estimated splits for A1 and E1 are uniform across all periods:
+\begin{itemize}
+    \item \textbf{Kad\i k\"{o}y (A1)}: 64.6\% to Emin\"{o}n\"{u} (E1), 35.4\% to Be\c{s}ikta\c{s} (E2).
+    \item \textbf{Emin\"{o}n\"{u} (E1)}: 64.5\% to Kad\i k\"{o}y (A1), 35.5\% to \"Usk\"{u}dar (A2).
+\end{itemize}
+
+\section{Simulation Model Design \& Verification}
+
+\subsection{Common Random Numbers (CRN) Synchronization}
+To perform a rigorous comparative analysis of the operational scenarios, we enforce Common Random Numbers (CRN). Rather than relying on globally shared generators, which de-synchronize when network structure or frequency changes, we design a hierarchical spawning structure using NumPy's `SeedSequence`:
+\begin{enumerate}
+    \item \textbf{Pre-sampled Passenger Attributes at Birth}: For each passenger, all stochastic attributes --- including destination, turnstile service time at the origin, transfer turnstile service time, boarding times for both legs, and the route switching decision --- are pre-sampled upon arrival using origin-specific RNGs. This guarantees that a passenger arriving at 07:15 in replication 5 has identical attributes across all scenarios.
+    \item \textbf{Line-Specific Weather RNGs}: Each directed line is assigned its own weather RNG. This prevents schedule changes on one line from shifting the cancellation outcomes on another.
+\end{enumerate}
+
+\subsection{Warm-up and EOD Handling}
+The simulation runs for 16 hours (06:00--22:00, 57,600 seconds). The first hour (06:00--07:00) is treated as the warm-up period. We discard all passenger records with arrival times before 07:00 from the KPIs. 
+
+Additionally, the load factor accumulations of capacity offered and passengers carried in `operate_trip` are only updated for trips departing after 07:00. Berth utilization post-warm-up busy time is computed by clipping occupancies to the interval $[3600, 57600]$. Passengers remaining in the system at 22:00 are excluded from journey time and wait time calculations.
+
+\section{Experimental Scenarios}
+We evaluate six operational scenarios over 20 replications:
+\begin{itemize}
+    \item \textbf{S1 (Baseline)}: Standard schedules, no shuttle, calm weather.
+    \item \textbf{S2 (High Frequency)}: Headways reduced by multiplying by 2/3 (peak headways: $L_1$ = 10m, $L_2, L_3$ = 13m, $L_4$ = 20m), no shuttle, calm weather.
+    \item \textbf{S3 (Shuttle Network)}: Standard schedules, active $L_5$ shuttle (15 min headways), calm weather.
+    \item \textbf{S4 (Storm Stress Test)}: Standard schedules, no shuttle, 20\% weather cancellations (Lodos).
+    \item \textbf{S5 (Full Intervention)}: High frequency (+50\% capacity), active $L_5$ shuttle, 20\% cancellations.
+    \item \textbf{S6 (Intermediate capacity)}: Custom scenario with a 25\% headway reduction (multiplier = 0.8) under calm weather.
+\end{itemize}
+
+\section{Results and Performance Analysis}
+The mean values and 95\% confidence intervals for the primary performance measures across all six scenarios are compiled in Table \ref{tab:simulation_results}.
+
+\begin{table}[H]
+\centering
+\caption{Simulation Performance Metrics (Mean and 95\% Confidence Intervals)}
+\label{tab:simulation_results}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Metric} & \textbf{S1 (Baseline)} & \textbf{S2 (High Freq.)} & \textbf{S3 (Shuttle)} & \textbf{S4 (Storm)} & \textbf{S5 (Full Interv.)} & \textbf{S6 (Custom)} \\
+\midrule
+`avg_journey_time` (min) & 40.27 [39.88, 40.67] & 30.54 [30.51, 30.56] & 36.49 [36.43, 36.55] & 66.96 [64.24, 69.69] & 37.55 [36.80, 38.29] & 32.81 [32.78, 32.83] \\
+`avg_wait_kadikoy` (min) & 17.89 [17.09, 18.69] &  4.74 [ 4.70,  4.78] & 10.23 [10.13, 10.34] & 53.88 [48.55, 59.20] & 10.71 [ 9.73, 11.69] &  6.59 [ 6.54,  6.64] \\
+`avg_wait_uskudar` (min) & 18.51 [17.90, 19.12] &  9.20 [ 9.15,  9.26] & 16.30 [16.18, 16.42] & 52.77 [45.26, 60.27] & 19.93 [17.73, 22.13] & 11.99 [11.94, 12.04] \\
+`avg_wait_eminonu` (min) &  8.46 [ 8.41,  8.51] &  4.29 [ 4.25,  4.33] &  8.24 [ 8.19,  8.29] & 15.74 [14.42, 17.06] &  8.52 [ 7.93,  9.10] &  6.02 [ 5.97,  6.07] \\
+`avg_wait_besiktas` (min) & 14.74 [14.62, 14.86] &  8.56 [ 8.45,  8.66] & 14.72 [14.60, 14.84] & 25.57 [23.85, 27.29] & 14.70 [13.85, 15.56] & 11.46 [11.40, 11.53] \\
+\midrule
+`loss_rate` (balks)      &  0.00 [ 0.00,  0.00] &  0.00 [ 0.00,  0.00] &  0.00 [ 0.00,  0.00] &  0.035 [ 0.025, 0.045] &  0.001 [ 0.000, 0.001] &  0.00 [ 0.00,  0.00] \\
+`left_behind_rate`       &  0.123 [0.116, 0.130] &  0.002 [0.001, 0.002] &  0.030 [0.028, 0.033] &  0.331 [0.306, 0.357] &  0.074 [0.060, 0.088] &  0.003 [0.002, 0.004] \\
+`missed_conn_rate`       &  0.00 [ 0.00,  0.00] &  0.00 [ 0.00,  0.00] &  0.001 [0.000, 0.003] &  0.00 [ 0.00,  0.00] &  0.238 [0.153, 0.323] &  0.00 [ 0.00,  0.00] \\
+\midrule
+`load_factor_L1`         &  0.376 [0.374, 0.378] &  0.251 [0.249, 0.252] &  0.384 [0.382, 0.386] &  0.465 [0.456, 0.474] &  0.324 [0.317, 0.332] &  0.298 [0.296, 0.299] \\
+`load_factor_L2`         &  0.555 [0.551, 0.558] &  0.378 [0.376, 0.381] &  0.534 [0.531, 0.536] &  0.675 [0.662, 0.688] &  0.452 [0.443, 0.461] &  0.456 [0.453, 0.459] \\
+`load_factor_L3`         &  0.444 [0.441, 0.447] &  0.302 [0.300, 0.304] &  0.450 [0.447, 0.453] &  0.529 [0.508, 0.550] &  0.396 [0.381, 0.411] &  0.365 [0.363, 0.367] \\
+`load_factor_L4`         &  0.534 [0.531, 0.536] &  0.350 [0.348, 0.352] &  0.524 [0.522, 0.527] &  0.628 [0.607, 0.648] &  0.420 [0.409, 0.431] &  0.435 [0.433, 0.437] \\
+\midrule
+`berth_util_kadikoy`     &  0.149 [0.149, 0.149] &  0.220 [0.220, 0.220] &  0.149 [0.149, 0.149] &  0.121 [0.118, 0.124] &  0.176 [0.172, 0.180] &  0.184 [0.184, 0.184] \\
+`berth_util_eminonu`     &  0.149 [0.149, 0.149] &  0.220 [0.220, 0.220] &  0.282 [0.282, 0.282] &  0.116 [0.112, 0.121] &  0.335 [0.329, 0.341] &  0.184 [0.184, 0.184] \\
+\midrule
+`throughput` (pax/hr)    & 1774.6 [1768.8, 1780.5] & 1778.1 [1772.3, 1784.0] & 1774.6 [1768.8, 1780.5] & 1699.8 [1679.7, 1719.9] & 1772.1 [1765.1, 1779.0] & 1782.9 [1776.9, 1788.8] \\
+`total_pax_served`       & 26619.2 [26531.3, 26707.0] & 26671.9 [26584.3, 26759.4] & 26619.2 [26531.3, 26707.0] & 25497.6 [25196.1, 25799.1] & 26581.2 [26477.1, 26685.2] & 26742.9 [26654.0, 26831.8] \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Operational Insights}
+\begin{itemize}
+    \item \textbf{Capacity and Frequency Investments (S1 vs. S2 vs. S6)}: Transitioning to the 50\% higher frequency scenario (S2) dramatically reduces average waiting times, particularly at Kad\i k\"{o}y (from 17.89 to 4.74 min, a 73.5\% reduction) and \"Usk\"{u}dar (from 18.51 to 9.20 min). As a result, the average journey time decreases from 40.27 to 30.54 minutes. However, this comes at the cost of higher berth utilization (increasing from 14.9\% to 22.0\%) and higher operational costs. Our custom scenario, S6, shows that a 25\% headway reduction provides an excellent compromise: it reduces Kad\i k\"{o}y wait times to 6.59 minutes and average journey times to 32.81 minutes, capturing 75\% of the wait time benefits of S2 while deploying significantly fewer vessels.
+    \item \textbf{Shuttle Network Integration (S3)}: Activating the $L_5$ shuttle (S3) allows left-behind passengers at A1 and A2 to reroute. This reduces the left-behind rate from 12.3\% to 3.0\%, lowering Kad\i k\"{o}y waiting times from 17.89 to 10.23 minutes and \"Usk\"{u}dar waiting times to 16.30 minutes. The average journey time falls by 9.4\% to 36.49 minutes. Because weather conditions are calm, transfer passengers experience minimal delay at Emin\"{o}n\"{u}, resulting in a missed connection rate of just 0.14\%.
+    \item \textbf{Storm Disruption Impacts (S4)}: Under Lodos storm conditions (S4), a 20\% cancellation rate creates severe gridlock. The left-behind rate surges to 33.1\%, and passenger waiting times balloon to over 50 minutes at Kad\i k\"{o}y and \"Usk\"{u}dar. Crucially, the terminal waiting areas overflow, resulting in a passenger loss rate of 3.5\% (balking). The average journey time increases to 66.96 minutes, and throughput drops by 4.2\% as passengers are lost.
+    \item \textbf{Full Mitigation Strategy (S5)}: Implementing the combined policy of a 50\% frequency increase and the $L_5$ shuttle under storm conditions (S5) is highly effective. The higher frequency absorbs the demand spikes caused by cancellations. The passenger loss rate drops from 3.5\% to 0.06\% (effectively resolving terminal overflow), and the average journey time is brought down to 37.55 minutes. However, due to storm-related cancellations, shuttle departures are also cancelled, raising the missed connection rate for transfer passengers to 23.8\%.
+\end{itemize}
+
+\section{Conclusions and Policy Recommendations}
+Based on the simulation results, we draw the following conclusions:
+\begin{enumerate}
+    \item \textbf{Normal Conditions Strategy}: In calm weather, a full 50\% capacity increase (S2) is highly effective but may represent an over-investment given the low load factors ($LF \le 0.38$). The custom intermediate frequency scenario (S6) is recommended as the default policy: it achieves 75\% of the wait time reduction of S2, maintains low load factors, and reduces operational vessel-hour costs.
+    \item \textbf{Storm Mitigation Strategy}: To build resilience against Lodos storms, a standalone shuttle (S3) or standard frequency (S4) is insufficient, leading to terminal congestion and passenger loss. A dynamic policy is recommended: when Lodos warnings are issued, the terminal operators should immediately trigger the **Full Intervention (S5)** policy, deploying 50\% higher frequencies on all lines and activating the European-side shuttle to allow cross-transit routing.
+\end{enumerate}
+
+\end{document}
